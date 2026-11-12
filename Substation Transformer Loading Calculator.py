@@ -1,816 +1,207 @@
+"""EE347 Task 3.2.7 — theoretical 208-V transformer-bank loading.
+
+Run in Spyder or with: python EE347_Transformer_Gradient_Heatmap.py
+Dependencies: numpy and matplotlib (available in standard Spyder setups).
+
+Creates one PNG gradient heatmap and an overload-only CSV.
+
+MODELING NOTE: PF=0.95 is a chosen LAGGING INPUT power-factor assumption;
+it is NOT implied by a manufacturer's reported 4.7% VFD relative loss.
+For a real VFD, harmonics and VFD-input measurements matter.
 """
-EE 347 - Power Systems I
-Task 3: Substation Transformer Loading Calculator
-
-System:
-    Three-phase 208 V / 208 V Delta-Delta transformer bank
-    Three single-phase transformers, 250 VA each
-    Total three-phase transformer rating: 750 VA
-
-    Feeder 1:
-        Wye-connected resistive load bank
-        Delta-connected capacitive load bank
-
-    Feeder 2:
-        GS13N-20P2 Variable Frequency Drive
-        Four-pole squirrel-cage induction motor
-        Four-quadrant dynamometer
-
-Purpose:
-    Calculate transformer loading for any combination of
-    resistive, capacitive, and motor loading.
-
-    Determine whether the combined feeder loading exceeds
-    the rated transformer capacity (750 VA).
-
-Note:
-    Motor/VFD electrical loading is estimated unless actual
-    VFD input measurements are provided.
-"""
-
+from pathlib import Path
+import csv
 import math
+from itertools import product
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+
+# ------------ Change these inputs as desired -----------------
+V_LL = 208.0                         # 3-phase transformer secondary line-to-line V
+FREQUENCY_HZ = 60.0                  # source frequency
+TRANSFORMER_VA = 3 * 250.0          # 3 x 250 VA delta-delta transformers
+RPM = 1770.0                        # fixed hypothetical shaft speed
+PF_VFD_INPUT = 0.95                 # chosen lagging input power factor
+MOTOR_EFF = 1.00                    # idealized efficiency
+VFD_EFF = 1.00                      # idealized efficiency
+TORQUE_MIN_NM = 0.0
+TORQUE_MAX_NM = 1.25
+TORQUE_SAMPLES = 301                 # fine torque sweep for smooth appearance
+RESISTANCES_OHM = (1200.0, 600.0, 300.0)     # per phase, wye
+CAPACITANCES_UF = (2.2, 4.4, 8.8)           # per branch, delta
+MOTOR_RATED_OUTPUT_W = 175.0
+DYNAMOMETER_RATED_OUTPUT_W = 350.0
+# -------------------------------------------------------------
+
+OUTPUT_DIR = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()
+PNG_FILE = OUTPUT_DIR / 'EE347_Transformer_Gradient_Heatmap.png'
+CSV_FILE = OUTPUT_DIR / 'EE347_Heatmap_Overloads_Only.csv'
 
 
-# ============================================================
-# 1. SYSTEM CONSTANTS
-# ============================================================
-
-V_LL = 208.0                  # Line-to-line voltage (V)
-FREQUENCY = 60.0              # System frequency (Hz)
-
-TRANSFORMER_COUNT = 3
-TRANSFORMER_VA_EACH = 250.0
-
-TRANSFORMER_RATED_VA = (
-    TRANSFORMER_COUNT * TRANSFORMER_VA_EACH
-)
-
-TRANSFORMER_RATED_CURRENT = (
-    TRANSFORMER_RATED_VA /
-    (math.sqrt(3) * V_LL)
-)
-
-# Resistive load bank (Ohms per phase)
-RESISTOR_STEPS = {
-    1: 1200.0,
-    2: 600.0,
-    3: 300.0
-}
-
-# Capacitive load bank (microfarads per delta branch)
-CAPACITOR_STEPS = {
-    1: 2.2,
-    2: 4.4,
-    3: 8.8
-}
-
-# Capacitor nameplate
-CAP_RATED_VAR = 252.0
-CAP_RATED_VOLTAGE = 120.0
-CAP_MAX_VOLTAGE = 230.0
-
-# Motor nameplate
-MOTOR_RATED_POWER = 175.0     # Mechanical output (W)
-MOTOR_RATED_RPM = 1670.0
-MOTOR_RATED_CURRENT = 1.2
-MOTOR_RATED_VOLTAGE = 208.0
-
-# Dynamometer limits
-DYNAMOMETER_MAX_TORQUE = 3.0  # N*m
-DYNAMOMETER_MAX_RPM = 2500.0
-DYNAMOMETER_MAX_POWER = 350.0 # W
-
-# Assumed efficiencies
-DEFAULT_MOTOR_EFF = 0.75
-DEFAULT_VFD_EFF = 0.90
-
-# Assumed VFD input displacement power factor
-DEFAULT_VFD_PF = 0.95
+def subset_label(flags, values, unit=''):
+    items = [f'{v:g}' for flag, v in zip(flags, values) if flag]
+    return '+'.join(items) if items else 'none'
 
 
-# ============================================================
-# 2. INPUT FUNCTIONS
-# ============================================================
+def make_heatmap():
+    if not (0 < PF_VFD_INPUT <= 1):
+        raise ValueError('Input PF must be in (0, 1].')
+    if MOTOR_EFF <= 0 or VFD_EFF <= 0:
+        raise ValueError('Efficiencies must be positive.')
+    if TORQUE_MIN_NM < 0 or TORQUE_MAX_NM <= TORQUE_MIN_NM:
+        raise ValueError('Invalid torque range.')
 
-def yes_no(prompt):
+    torques = np.linspace(TORQUE_MIN_NM, TORQUE_MAX_NM, TORQUE_SAMPLES)
+    shaft_w = torques * (2 * math.pi * RPM / 60.0)
+    p_vfd = shaft_w / (MOTOR_EFF * VFD_EFF)
+    q_vfd = p_vfd * math.tan(math.acos(PF_VFD_INPUT))  # positive: lagging
 
-    while True:
+    resistor_states = list(product((False, True), repeat=3))
+    capacitor_states = list(product((False, True), repeat=3))
+    # Each section contains eight resistor choices at one fixed capacitor choice.
+    # Sort by number / size of enabled steps to make the map easier to read.
+    resistor_states.sort(key=lambda flags: sum(1 / r for flag, r in zip(flags, RESISTANCES_OHM) if flag))
+    capacitor_states.sort(key=lambda flags: sum(c for flag, c in zip(flags, CAPACITANCES_UF) if flag))
 
-        response = input(prompt + " [y/n]: ").strip().lower()
+    configurations = []
+    for c_flags in capacitor_states:
+        for r_flags in resistor_states:
+            p_r = sum(V_LL ** 2 / r for on, r in zip(r_flags, RESISTANCES_OHM) if on)
+            q_c = -3 * V_LL ** 2 * 2 * math.pi * FREQUENCY_HZ * sum(
+                c * 1e-6 for on, c in zip(c_flags, CAPACITANCES_UF) if on
+            )
+            configurations.append((r_flags, c_flags, p_r, q_c))
 
-        if response in ("y", "yes"):
-            return True
+    # Algebraically add the signed P and Q at the modeled source-side bus.
+    p_total = np.array([row[2] for row in configurations])[:, None] + p_vfd[None, :]
+    q_total = np.array([row[3] for row in configurations])[:, None] + q_vfd[None, :]
+    apparent_va = np.hypot(p_total, q_total)
+    current_a = apparent_va / (math.sqrt(3) * V_LL)
+    loading_pct = 100 * apparent_va / TRANSFORMER_VA
 
-        elif response in ("n", "no"):
-            return False
+    # Color transition: green -> yellow -> orange near 98-100% -> red above 100%.
+    vmax = max(125, math.ceil(float(loading_pct.max()) / 5) * 5)
+    steps = [
+        (0.0, '#247349'),
+        (70.0, '#48ab70'),
+        (85.0, '#c4df86'),
+        (94.0, '#f7df72'),
+        (98.0, '#f5a53b'),
+        (100.0, '#ee681f'),
+        (100.1, '#da4541'),
+        (vmax, '#8c233a'),
+    ]
+    cmap = LinearSegmentedColormap.from_list(
+        'EE347_loading', [(x / vmax, col) for x, col in steps], N=512
+    )
 
-        else:
-            print("Please enter y or n.")
+    fig, ax = plt.subplots(figsize=(16, 15), constrained_layout=False)
+    fig.patch.set_facecolor('white')
+    img = ax.imshow(
+        loading_pct, origin='upper', aspect='auto', interpolation='bilinear',
+        cmap=cmap, norm=Normalize(vmin=0, vmax=vmax),
+        extent=(TORQUE_MIN_NM, TORQUE_MAX_NM, 63.5, -0.5)
+    )
 
-
-def get_float(prompt, default=None, minimum=None, maximum=None):
-
-    while True:
-
-        if default is not None:
-            response = input(
-                f"{prompt} [{default}]: "
-            ).strip()
-        else:
-            response = input(
-                f"{prompt}: "
-            ).strip()
-
-        if response == "" and default is not None:
-            value = default
-
-        else:
-            try:
-                value = float(response)
-
-            except ValueError:
-                print("Please enter a valid number.")
-                continue
-
-        if not math.isfinite(value):
-            print("Please enter a finite number.")
-            continue
-
-        if minimum is not None and value < minimum:
-            print(f"Value must be at least {minimum}.")
-            continue
-
-        if maximum is not None and value > maximum:
-            print(f"Value must not exceed {maximum}.")
-            continue
-
-        return value
-
-
-def select_steps(name, steps, unit):
-
-    print(f"\n{name}")
-
-    for number, value in steps.items():
-        print(f"  {number}: {value} {unit}")
-
-    print("Enter step numbers separated by commas.")
-    print("Example: 1,3")
-    print("Press Enter for no load.")
-
-    while True:
-
-        response = input("Selected steps: ").strip()
-
-        if response == "":
-            return []
-
+    # Mark the two reference loading contours on the smooth map.
+    # On a 64-row raster, contouring across adjacent rows is just a visual guide.
+    X, Y = np.meshgrid(torques, np.arange(64))
+    for level, style, color, weight in [(98, '--', '#2e3234', 1.25), (100, '-', '#1d1d1d', 1.6)]:
         try:
-
-            selected = [
-                int(item.strip())
-                for item in response.split(",")
-            ]
-
-            if len(selected) != len(set(selected)):
-                print("Do not enter duplicate steps.")
-                continue
-
-            if all(step in steps for step in selected):
-                return selected
-
-            print("Invalid step selection.")
-
+            ax.contour(X, Y, loading_pct, levels=[level], colors=[color],
+                       linestyles=[style], linewidths=weight)
         except ValueError:
-            print("Enter numbers separated by commas.")
-
-
-# ============================================================
-# 3. SWITCHGEAR STATUS
-# ============================================================
-
-def get_switchgear_status():
-
-    print("\n" + "=" * 60)
-    print("SWITCHGEAR STATUS")
-    print("=" * 60)
-
-    xmfr = yes_no("XMFR switchgear closed?")
-
-    if not xmfr:
-
-        print("\nXMFR is OPEN.")
-        print("All downstream loads are disconnected.")
-
-        return False, False, False, False
-
-    bus = yes_no("Bus switchgear closed?")
-
-    if not bus:
-
-        print("\nBus is OPEN.")
-        print("Both feeders are disconnected.")
-
-        return True, False, False, False
-
-    feeder1 = yes_no("Feeder 1 closed?")
-    feeder2 = yes_no("Feeder 2 closed?")
-
-    return xmfr, bus, feeder1, feeder2
-
-
-# ============================================================
-# 4. RESISTIVE LOAD CALCULATIONS
-# ============================================================
-
-def calculate_resistive_load(selected_steps):
-
-    """
-    Wye-connected balanced resistive load.
-
-    V_phase = V_LL / sqrt(3)
-
-    P_3phase = 3 * V_phase^2 / R
-
-    Equivalent:
-    P_3phase = V_LL^2 / R
-
-    Each selected step is treated as a balanced
-    three-phase resistance connected in parallel.
-    """
-
-    total_power = 0.0
-
-    print("\nRESISTIVE LOAD CALCULATIONS")
-
-    for step in selected_steps:
-
-        resistance = RESISTOR_STEPS[step]
-
-        power = V_LL**2 / resistance
-
-        total_power += power
-
-        print(
-            f"Step {step}: "
-            f"{resistance:.0f} ohm -> "
-            f"{power:.2f} W"
-        )
-
-    print(f"Total resistive power: {total_power:.2f} W")
-
-    return total_power
-
-
-# ============================================================
-# 5. CAPACITIVE LOAD CALCULATIONS
-# ============================================================
-
-def calculate_capacitive_load(selected_steps):
-
-    """
-    Delta-connected balanced capacitive load.
-
-    Each delta branch experiences V_LL.
-
-    Q_3phase = -3 * V_LL^2 * omega * C
-
-    Negative reactive power represents
-    capacitive reactive power.
-    """
-
-    omega = 2 * math.pi * FREQUENCY
-
-    total_reactive_power = 0.0
-
-    print("\nCAPACITIVE LOAD CALCULATIONS")
-
-    for step in selected_steps:
-
-        capacitance_uF = CAPACITOR_STEPS[step]
-
-        capacitance_F = capacitance_uF * 1e-6
-
-        reactive_power = (
-            -3 *
-            V_LL**2 *
-            omega *
-            capacitance_F
-        )
-
-        total_reactive_power += reactive_power
-
-        print(
-            f"Step {step}: "
-            f"{capacitance_uF:.1f} uF -> "
-            f"{reactive_power:.2f} VAR"
-        )
-
-    print(
-        f"Total capacitive reactive power: "
-        f"{total_reactive_power:.2f} VAR"
-    )
-
-    if abs(total_reactive_power) > CAP_RATED_VAR:
-
-        print(
-            "NOTICE: Capacitive reactive power exceeds "
-            "the nominal 252 VAR nameplate value."
-        )
-
-    if V_LL > CAP_MAX_VOLTAGE:
-
-        print(
-            "WARNING: Capacitor voltage exceeds "
-            "the 230 V maximum rating!"
-        )
-
-    return total_reactive_power
-
-
-# ============================================================
-# 6. MOTOR AND DYNAMOMETER CALCULATIONS
-# ============================================================
-
-def calculate_motor_load():
-
-    print("\n" + "=" * 60)
-    print("MOTOR AND DYNAMOMETER LOADING")
-    print("=" * 60)
-
-    motor_running = yes_no("Is the motor running?")
-
-    if not motor_running:
-
-        print("Motor is not running.")
-
-        return 0.0, 0.0, 0.0
-
-    torque = get_float(
-        "Dynamometer torque (N*m)",
-        default=0.0,
-        minimum=0.0,
-        maximum=DYNAMOMETER_MAX_TORQUE
-    )
-
-    rpm = get_float(
-        "Motor speed (RPM)",
-        default=MOTOR_RATED_RPM,
-        minimum=0.0,
-        maximum=DYNAMOMETER_MAX_RPM
-    )
-
-    # Mechanical shaft power
-    mechanical_power = (
-        2 * math.pi * rpm * torque / 60
-    )
-
-    print(
-        f"\nMechanical shaft power: "
-        f"{mechanical_power:.2f} W"
-    )
-
-    if mechanical_power > MOTOR_RATED_POWER:
-
-        print(
-            "WARNING: Mechanical shaft power exceeds "
-            "the motor's rated 175 W output."
-        )
-
-    if mechanical_power > DYNAMOMETER_MAX_POWER:
-
-        print(
-            "WARNING: Mechanical power exceeds "
-            "the dynamometer's 350 W rating."
-        )
-
-    print("\nEnter estimated efficiencies.")
-
-    motor_eff = get_float(
-        "Motor efficiency",
-        default=DEFAULT_MOTOR_EFF,
-        minimum=0.01,
-        maximum=1.0
-    )
-
-    vfd_eff = get_float(
-        "VFD efficiency",
-        default=DEFAULT_VFD_EFF,
-        minimum=0.01,
-        maximum=1.0
-    )
-
-    vfd_pf = get_float(
-        "Estimated VFD input power factor",
-        default=DEFAULT_VFD_PF,
-        minimum=0.01,
-        maximum=1.0
-    )
-
-    # Electrical real power at VFD input
-    electrical_power = (
-        mechanical_power /
-        (motor_eff * vfd_eff)
-    )
-
-    # Apparent power estimate
-    apparent_power = electrical_power / vfd_pf
-
-    # Equivalent nonactive power estimate
-    nonactive_power = math.sqrt(
-        max(
-            apparent_power**2 - electrical_power**2,
-            0.0
-        )
-    )
-
-    print("\nMOTOR/VFD RESULTS")
-
-    print(
-        f"Mechanical power: "
-        f"{mechanical_power:.2f} W"
-    )
-
-    print(
-        f"Estimated VFD input real power: "
-        f"{electrical_power:.2f} W"
-    )
-
-    print(
-        f"Estimated VFD input apparent power: "
-        f"{apparent_power:.2f} VA"
-    )
-
-    print(
-        f"Equivalent nonactive power: "
-        f"{nonactive_power:.2f} VAR-equivalent"
-    )
-
-    return (
-        electrical_power,
-        apparent_power,
-        nonactive_power
-    )
-
-
-# ============================================================
-# 7. TRANSFORMER LOADING CALCULATIONS
-# ============================================================
-
-def calculate_transformer_loading(
-    resistor_power,
-    capacitor_reactive_power,
-    motor_real_power,
-    motor_apparent_power,
-    motor_nonactive_power
-):
-
-    print("\n" + "=" * 60)
-    print("TRANSFORMER LOADING RESULTS")
-    print("=" * 60)
-
-    # Total real power
-    total_real_power = (
-        resistor_power + motor_real_power
-    )
-
-    # Illustrative reactive-power combination.
-    #
-    # This assumes motor/VFD nonactive power behaves
-    # as positive fundamental reactive power.
-    #
-    # Actual VFD harmonic distortion may prevent
-    # this assumption from being accurate.
-
-    illustrative_reactive_power = (
-        capacitor_reactive_power +
-        motor_nonactive_power
-    )
-
-    illustrative_apparent_power = math.sqrt(
-        total_real_power**2 +
-        illustrative_reactive_power**2
-    )
-
-    # Conservative upper bound using triangle inequality
-    #
-    # Does not assume capacitive compensation
-    # cancels VFD harmonic/nonactive loading.
-
-    resistor_apparent_power = abs(resistor_power)
-
-    capacitor_apparent_power = abs(
-        capacitor_reactive_power
-    )
-
-    conservative_upper_bound = (
-        resistor_apparent_power +
-        capacitor_apparent_power +
-        motor_apparent_power
-    )
-
-    # Transformer loading percentages
-    illustrative_loading_percent = (
-        illustrative_apparent_power /
-        TRANSFORMER_RATED_VA * 100
-    )
-
-    upper_bound_percent = (
-        conservative_upper_bound /
-        TRANSFORMER_RATED_VA * 100
-    )
-
-    # Estimated line current
-    illustrative_line_current = (
-        illustrative_apparent_power /
-        (math.sqrt(3) * V_LL)
-    )
-
-    upper_bound_line_current = (
-        conservative_upper_bound /
-        (math.sqrt(3) * V_LL)
-    )
-
-    # Illustrative overall power factor
-    if illustrative_apparent_power > 0:
-
-        overall_pf = (
-            total_real_power /
-            illustrative_apparent_power
-        )
-
-    else:
-        overall_pf = 1.0
-
-    print("\nINDIVIDUAL LOADS")
-
-    print(
-        f"Resistive real power: "
-        f"{resistor_power:.2f} W"
-    )
-
-    print(
-        f"Capacitive reactive power: "
-        f"{capacitor_reactive_power:.2f} VAR"
-    )
-
-    print(
-        f"Motor/VFD real power: "
-        f"{motor_real_power:.2f} W"
-    )
-
-    print(
-        f"Motor/VFD apparent power: "
-        f"{motor_apparent_power:.2f} VA"
-    )
-
-    print("\nCOMBINED LOAD")
-
-    print(
-        f"Total real power: "
-        f"{total_real_power:.2f} W"
-    )
-
-    print(
-        f"Illustrative reactive power: "
-        f"{illustrative_reactive_power:.2f} VAR"
-    )
-
-    print(
-        f"Illustrative apparent power: "
-        f"{illustrative_apparent_power:.2f} VA"
-    )
-
-    print(
-        f"Illustrative power factor: "
-        f"{overall_pf:.4f}"
-    )
-
-    print(
-        f"Illustrative line current: "
-        f"{illustrative_line_current:.3f} A"
-    )
-
-    print("\nTRANSFORMER CAPACITY")
-
-    print(
-        f"Rated transformer capacity: "
-        f"{TRANSFORMER_RATED_VA:.2f} VA"
-    )
-
-    print(
-        f"Rated transformer line current: "
-        f"{TRANSFORMER_RATED_CURRENT:.3f} A"
-    )
-
-    print(
-        f"Illustrative loading: "
-        f"{illustrative_loading_percent:.2f}%"
-    )
-
-    print(
-        f"Conservative apparent-power upper bound: "
-        f"{conservative_upper_bound:.2f} VA"
-    )
-
-    print(
-        f"Conservative loading bound: "
-        f"{upper_bound_percent:.2f}%"
-    )
-
-    print(
-        f"Conservative line-current bound: "
-        f"{upper_bound_line_current:.3f} A"
-    )
-
-    # ========================================================
-    # 8. TRANSFORMER CAPACITY ASSESSMENT
-    # ========================================================
-
-    print("\n" + "-" * 60)
-    print("TASK 3.2.7 CAPACITY ASSESSMENT")
-    print("-" * 60)
-
-    if total_real_power > TRANSFORMER_RATED_VA:
-
-        print("RESULT: TRANSFORMER OVERLOAD")
-
-        print(
-            "Real power alone exceeds the transformer's "
-            "rated apparent-power capacity."
-        )
-
-    elif conservative_upper_bound <= TRANSFORMER_RATED_VA:
-
-        print("RESULT: WITHIN TRANSFORMER CAPACITY")
-
-        print(
-            "The conservative apparent-power upper bound "
-            "is within the 750 VA transformer rating."
-        )
-
-    elif motor_apparent_power == 0:
-
-        if illustrative_apparent_power > TRANSFORMER_RATED_VA:
-
-            print("RESULT: TRANSFORMER OVERLOAD")
-
-            print(
-                "Calculated apparent power exceeds "
-                "the 750 VA transformer rating."
-            )
-
-        else:
-
-            print("RESULT: WITHIN TRANSFORMER CAPACITY")
-
-            print(
-                "Calculated apparent power is within "
-                "the 750 VA transformer rating."
-            )
-
-    else:
-
-        print("RESULT: CAPACITY NOT VERIFIED")
-
-        print(
-            "The conservative upper bound exceeds "
-            "750 VA, but this does not prove an overload."
-        )
-
-        print(
-            "Actual VFD input measurements are needed "
-            "for a more reliable assessment."
-        )
-
-    print("-" * 60)
-
-
-# ============================================================
-# 9. MAIN PROGRAM
-# ============================================================
-
-def main():
-
-    print("\n" + "=" * 60)
-    print("EE 347 - TASK 3")
-    print("SUBSTATION TRANSFORMER LOADING CALCULATOR")
-    print("=" * 60)
-
-    print("\nSYSTEM INFORMATION")
-
-    print(f"System voltage: {V_LL:.0f} V L-L")
-    print(f"Frequency: {FREQUENCY:.0f} Hz")
-
-    print(
-        f"Transformer bank rating: "
-        f"{TRANSFORMER_RATED_VA:.0f} VA"
-    )
-
-    print(
-        f"Rated line current: "
-        f"{TRANSFORMER_RATED_CURRENT:.3f} A"
-    )
-
-    while True:
-
-        # Switchgear status
-        xmfr, bus, feeder1, feeder2 = (
-            get_switchgear_status()
-        )
-
-        resistor_power = 0.0
-        capacitor_reactive_power = 0.0
-
-        motor_real_power = 0.0
-        motor_apparent_power = 0.0
-        motor_nonactive_power = 0.0
-
-        # ====================================================
-        # FEEDER 1
-        # ====================================================
-
-        if feeder1:
-
-            print("\n" + "=" * 60)
-            print("FEEDER 1 - RESISTIVE/CAPACITIVE LOADS")
-            print("=" * 60)
-
-            resistor_selection = select_steps(
-                "RESISTOR BANK",
-                RESISTOR_STEPS,
-                "ohm"
-            )
-
-            capacitor_selection = select_steps(
-                "CAPACITOR BANK",
-                CAPACITOR_STEPS,
-                "uF"
-            )
-
-            resistor_power = calculate_resistive_load(
-                resistor_selection
-            )
-
-            capacitor_reactive_power = (
-                calculate_capacitive_load(
-                    capacitor_selection
-                )
-            )
-
-        else:
-
-            print("\nFeeder 1 is OPEN.")
-            print("Resistive and capacitive loads disconnected.")
-
-        # ====================================================
-        # FEEDER 2
-        # ====================================================
-
-        if feeder2:
-
-            print("\n" + "=" * 60)
-            print("FEEDER 2 - MOTOR/VFD")
-            print("=" * 60)
-
-            (
-                motor_real_power,
-                motor_apparent_power,
-                motor_nonactive_power
-            ) = calculate_motor_load()
-
-        else:
-
-            print("\nFeeder 2 is OPEN.")
-            print("Motor load disconnected.")
-
-        # ====================================================
-        # TOTAL TRANSFORMER LOADING
-        # ====================================================
-
-        calculate_transformer_loading(
-            resistor_power,
-            capacitor_reactive_power,
-            motor_real_power,
-            motor_apparent_power,
-            motor_nonactive_power
-        )
-
-        print("\n")
-
-        again = yes_no(
-            "Calculate another loading combination?"
-        )
-
-        if not again:
-
-            print("\nProgram finished.")
-            break
-
-
-# ============================================================
-# 10. RUN PROGRAM
-# ============================================================
-
-if __name__ == "__main__":
-    main()
+            pass
+
+    # Label each of the 64 rows with actual selected hardware steps, not binary IDs.
+    labels = [
+        f'R {subset_label(r, RESISTANCES_OHM):<14}  |  C {subset_label(c, CAPACITANCES_UF)}'
+        for r, c, _, _ in configurations
+    ]
+    ax.set_yticks(range(64))
+    ax.set_yticklabels(labels, fontsize=6.8, family='monospace')
+    for group in range(1, 8):
+        ax.axhline(group * 8 - 0.5, color='#f4f4f4', lw=1.8, alpha=0.95)
+
+    ax.set_xlabel('Dynamometer torque (N·m), at fixed 1,770 RPM', fontsize=12, labelpad=10)
+    ax.set_ylabel('Feeder 1: enabled resistor steps (Ω) and capacitor steps (µF)', fontsize=11, labelpad=10)
+    fig.suptitle('EE 347  |  Transformer loading across 64 load-bank configurations',
+                 fontsize=17, weight='bold', y=0.982)
+    ax.set_xticks(np.arange(0, TORQUE_MAX_NM + 0.001, 0.125))
+    ax.tick_params(axis='x', labelsize=9)
+    ax.tick_params(axis='y', length=0, pad=5)
+
+    # Caption makes physical assumptions and rating warnings explicit.
+    fig.text(0.50, 0.954,
+             '750 VA bank  •  208 V three-phase  •  PF = 0.95 lagging at VFD input  •  ideal efficiencies',
+             ha='center', va='center', fontsize=11, color='#424b51')
+    fig.text(0.50, 0.928,
+             'Green: within rating     |     Yellow/orange: approaching 98–100%     |     Red: >100% overload',
+             ha='center', va='center', fontsize=10, color='#424b51')
+
+    cbar = fig.colorbar(img, ax=ax, fraction=0.023, pad=0.02)
+    cbar.set_label('Transformer loading (% of 750 VA)', fontsize=11)
+    cbar.ax.tick_params(labelsize=9)
+    for mark in (98, 100):
+        cbar.ax.axhline(mark, color='black', lw=1.3, linestyle='--' if mark == 98 else '-')
+
+    # A torque sweep can exceed the 175-W motor rating even if transformer remains within rating.
+    motor_torque_limit = MOTOR_RATED_OUTPUT_W * 60 / (2 * math.pi * RPM)
+    if TORQUE_MIN_NM < motor_torque_limit < TORQUE_MAX_NM:
+        ax.axvline(motor_torque_limit, color='white', lw=1.2, linestyle=':', alpha=0.9)
+        ax.text(motor_torque_limit + 0.005, -1.25, '175 W motor rated shaft limit',
+                color='#39424b', fontsize=8, rotation=0, ha='left', va='bottom')
+
+    fig.text(0.5, 0.016,
+             'THEORETICAL ONLY: VFD input PF is assumed (not derived from 4.7% power loss); '
+             'harmonics, standby draw and actual VFD efficiency excluded.',
+             ha='center', fontsize=8.5, color='#555d65')
+    plt.subplots_adjust(left=0.30, right=0.90, bottom=0.075, top=0.899)
+    fig.savefig(PNG_FILE, dpi=180, facecolor='white')
+    plt.close(fig)
+
+    # Export only overloads; record an overload interval rather than hundreds of
+    # near-identical rows from the continuous sweep.
+    # Each interval is a numerical approximation at TORQUE_SAMPLES resolution.
+    interval_count = 0
+    with CSV_FILE.open('w', newline='', encoding='utf-8-sig') as fp:
+        wr = csv.writer(fp)
+        wr.writerow(['Resistors ON (ohm)', 'Capacitors ON (uF)',
+                     'First overload torque (N m)', 'First overload motor shaft W',
+                     'First overload loading (%)', 'Maximum loading in sweep (%)',
+                     'Maximum apparent power (VA)', 'Max line current (A)'])
+        for i, (r_flags, c_flags, p_r, q_c) in enumerate(configurations):
+            over = np.flatnonzero(loading_pct[i, :] > 100 + 1e-10)
+            if len(over) == 0:
+                continue
+            # Some theoretical configurations can overload at low torque but
+            # recover as lagging Q offsets capacitive Q. Handle each run.
+            starts = over[np.r_[True, np.diff(over) > 1]]
+            ends = over[np.r_[np.diff(over) > 1, True]]
+            for start, end in zip(starts, ends):
+                j = int(start)
+                interval_count += 1
+                wr.writerow([
+                    subset_label(r_flags, RESISTANCES_OHM),
+                    subset_label(c_flags, CAPACITANCES_UF),
+                    f'{torques[j]:.4f}', f'{shaft_w[j]:.2f}',
+                    f'{loading_pct[i, j]:.2f}',
+                    f'{np.max(loading_pct[i, start:end+1]):.2f}',
+                    f'{np.max(apparent_va[i, start:end+1]):.2f}',
+                    f'{np.max(current_a[i, start:end+1]):.3f}',
+                ])
+
+    print(f'Heatmap: {PNG_FILE}')
+    print(f'Overload-only CSV: {CSV_FILE} ({interval_count} intervals)')
+    print(f'Number of R/C configurations: {len(configurations)}')
+    print(f'Torque samples: {len(torques)}')
+    print(f'Transformer rated current: {TRANSFORMER_VA/(math.sqrt(3)*V_LL):.3f} A')
+    print(f'Sweep maximum: {loading_pct.max():.2f}%')
+    print(f'Configurations with any overload: {np.any(loading_pct > 100, axis=1).sum()}')
+    print(f'Rated 175-W motor torque at {RPM:g} RPM: {motor_torque_limit:.3f} N*m')
+
+
+if __name__ == '__main__':
+    make_heatmap()
