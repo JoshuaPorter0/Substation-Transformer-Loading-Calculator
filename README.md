@@ -1,31 +1,39 @@
-# EE 347 - Substation Transformer Loading Calculator
+# EE 347 - Substation Transformer Loading Heatmap & Overload Analyzer
 
-This repository contains a Python script developed for the **EE 347 (Power Systems I) Term Project**. 
+This repository contains a Python script developed for the **EE 347 (Power Systems I) Term Project**.
 
-As outlined in **Deliverable 3.2.8** of the project specifications, this script calculates the loading on the substation transformer for any combination of loading from the resistor bank, capacitor bank, and motor. It determines whether the combined feeder loading exceeds the rated transformer capacity.
+As outlined in **Task 3.2.7** of the project specifications, this script models theoretical 208 V substation transformer-bank loading across all 64 possible Feeder 1 resistor/capacitor bank combinations over a continuous dynamometer torque sweep[cite: 1]. Rather than requiring manual interactive inputs, it automatically evaluates the operating space and exports a high-resolution gradient heatmap along with a CSV report of all overload intervals[cite: 1].
 
-## ⚙️ System Parameters
-The script models the following LabVolt substation equipment:
-*   **Transformer:** Three-phase 208 V / 208 V Delta-Delta bank (3x 250 VA single-phase transformers = **750 VA total**)
-*   **Feeder 1:** Wye-connected resistive load bank & Delta-connected capacitive load bank
-*   **Feeder 2:** GS13N-20P2 VFD, Four-pole squirrel-cage induction motor, and Four-quadrant dynamometer
+## ⚙️ System Parameters & Modeling Assumptions
+The script models the LabVolt substation setup using the following baseline parameters (configurable at the top of the script)[cite: 1]:
+* **Transformer Bank:** Three-phase 208 V / 208 V Delta-Delta bank (`3 × 250 VA` single-phase transformers = **750 VA** total; **2.082 A** rated line current)[cite: 1]
+* **Source Frequency:** 60 Hz[cite: 1]
+* **Feeder 1 (Static Loads):**
+  * **Resistive Load Bank (Wye-connected):** 1200 Ω, 600 Ω, and 300 Ω per-phase steps (8 combinations)[cite: 1]
+  * **Capacitive Load Bank (Delta-connected):** 2.2 µF, 4.4 µF, and 8.8 µF per-branch steps (8 combinations)[cite: 1]
+* **Feeder 2 (Motor & Drive):**
+  * **Motor/Dynamometer Operating Point:** Sweeps dynamometer torque from **0.0 to 1.25 N·m** (301 samples) at a fixed shaft speed of **1,770 RPM**[cite: 1]
+  * **Ratings & Assumptions:** 175 W rated motor shaft output (~0.944 N·m at 1,770 RPM), 350 W dynamometer rating, idealized 100% motor and VFD efficiencies, and an assumed **0.95 lagging input power factor** at the VFD[cite: 1]
 
-## ✨ Features
-*   **Interactive CLI:** Guides the user through switchgear status (XMFR, Bus, Feeder 1, Feeder 2) and load inputs.
-*   **Component-Level Inputs:** Allows selection of specific resistor/capacitor steps and motor torque/speed parameters.
-*   **Dual Assessment Methodology:** Calculates loading using an *Illustrative* method (assumes capacitive reactive power cancels motor reactive power) and a *Conservative Upper Bound* (assumes worst-case additive apparent power).
-*   **Safety Warnings:** Alerts the user if mechanical power exceeds motor/dynamometer limits, or if capacitor voltage exceeds ratings.
-*   **Capacity Assessment:** Concludes if the system is within the 750 VA capacity, overloaded, or if capacity cannot be verified without actual VFD measurements.
+## ✨ Features & Outputs
+* **Full Combinatorial & Torque Sweep:** Evaluates all **64** Feeder 1 R/C load-bank permutations across 301 torque points by algebraically summing active ($P$) and reactive ($Q$) power at the source-side bus[cite: 1].
+* **Gradient Heatmap (`EE347_Transformer_Gradient_Heatmap.png`):**
+  * Color-codes transformer loading (% of 750 VA) from green (safe) to yellow/orange (approaching 98–100%) to red (>100% overload)[cite: 1, 2].
+  * Plots **98%** (dashed) and **100%** (solid) loading contours alongside a vertical marker for the **175 W rated motor shaft limit**[cite: 1, 2].
+* **Overload Interval CSV (`EE347_Heatmap_Overloads_Only.csv`):** Filters out safe operating regions and logs contiguous overload intervals, recording exact threshold torque, motor shaft power, peak loading percentage, maximum apparent power (VA), and maximum line current (A)[cite: 1].
+* **Console Summary:** Prints file export paths, rated transformer current, overall sweep maximum loading, count of overloaded configurations, and the motor's rated torque limit[cite: 1].
+
+> **Modeling Note:** `PF = 0.95` is a theoretical lagging input power-factor assumption (not derived from a manufacturer's reported 4.7% VFD relative loss). Real-world VFD operation introduces current harmonics, standby draw, and efficiency losses not captured in this idealized sweep[cite: 1].
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-*   Python 3.x installed on your machine. (No external libraries are required; the script uses the built-in `math` module).
+* **Python 3.x**
+* **External Libraries:** `numpy` and `matplotlib` (included by default in standard Spyder/Anaconda installations)[cite: 1]
 
 ### Running the Script
-1. Clone the repository or download the `.py` file.
-2. Open a terminal or command prompt.
-3. Navigate to the folder containing the script.
-4. Run the script using the following command:
+1. Clone the repository or download `EE347_Transformer_Gradient_Heatmap.py`[cite: 1].
+2. Open a terminal, command prompt, or Spyder IDE and navigate to the script's directory[cite: 1].
+3. Run the script:
    ```bash
-   python "Substation Transformer Loading Calculator.py"
+   python EE347_Transformer_Gradient_Heatmap.py
